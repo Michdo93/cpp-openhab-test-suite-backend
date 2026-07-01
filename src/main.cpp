@@ -291,12 +291,21 @@ int main() {
     crow::App<CORSMiddleware> app;
     app.loglevel(crow::LogLevel::Warning);
 
-    // OPTIONS preflight
-    CROW_ROUTE(app, "/<path>").methods(crow::HTTPMethod::OPTIONS)
-    ([](const crow::request&, crow::response& res, const std::string&) {
+    // ── CORS preflight — explicit routes for every endpoint ──────────────────
+    // Crow's wildcard route /<path> misses the root "/" and can be unreliable
+    // for preflight OPTIONS across versions. Explicit routes are more robust.
+    auto corsHandler = [](const crow::request&, crow::response& res, const std::string&) {
         CORSMiddleware::addCors(res);
-        res.code = 204; res.end();
-    });
+        res.code = 204;
+        res.end();
+    };
+    CROW_ROUTE(app, "/")                .methods(crow::HTTPMethod::OPTIONS)([](){
+        crow::response res(204); CORSMiddleware::addCors(res); return res; });
+    CROW_ROUTE(app, "/api/connect")     .methods(crow::HTTPMethod::OPTIONS)([](){
+        crow::response res(204); CORSMiddleware::addCors(res); return res; });
+    CROW_ROUTE(app, "/api/test")        .methods(crow::HTTPMethod::OPTIONS)([](){
+        crow::response res(204); CORSMiddleware::addCors(res); return res; });
+    CROW_ROUTE(app, "/<path>")          .methods(crow::HTTPMethod::OPTIONS)(corsHandler);
 
     // Health check / wake-up
     CROW_ROUTE(app, "/").methods(crow::HTTPMethod::GET)
