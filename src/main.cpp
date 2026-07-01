@@ -52,11 +52,19 @@ static void respond_err(httplib::Response& res, const std::string& msg, int code
 
 // ─── Client factory ───────────────────────────────────────────────────────────
 
+static std::string jsonStr(const json& body, const std::string& key) {
+    // body.value(key, "") throws type_error.302 when the field exists but is
+    // JSON null (frontend sends null for empty optional fields). Handle both
+    // "absent" and "null" gracefully by returning an empty string.
+    if (!body.contains(key) || body[key].is_null()) return "";
+    return body[key].get<std::string>();
+}
+
 static OpenHABClient makeClient(const json& body) {
-    std::string url  = body.value("url",      "");
-    std::string user = body.value("username", "");
-    std::string pass = body.value("password", "");
-    std::string tok  = body.value("token",    "");
+    std::string url  = jsonStr(body, "url");
+    std::string user = jsonStr(body, "username");
+    std::string pass = jsonStr(body, "password");
+    std::string tok  = jsonStr(body, "token");
     if (url.empty()) throw std::invalid_argument("url is required");
     while (!url.empty() && url.back() == '/') url.pop_back();
     // Normalize: add http:// if no protocol given
