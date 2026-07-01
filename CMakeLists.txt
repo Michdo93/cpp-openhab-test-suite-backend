@@ -19,6 +19,12 @@ if(NOT nlohmann_json_FOUND)
 endif()
 
 # Crow – lightweight C++ HTTP server (header-only)
+# Instruct Crow to use the system-installed Asio (libasio-dev) rather than
+# trying to find Boost.Asio, and disable SSL so we don't need libssl linkage.
+set(CROW_USE_BOOST      OFF CACHE BOOL "" FORCE)
+set(CROW_ENABLE_SSL     OFF CACHE BOOL "" FORCE)
+set(ASIO_INCLUDE_DIR    /usr/include CACHE PATH "" FORCE)
+
 include(FetchContent)
 FetchContent_Declare(crow
   GIT_REPOSITORY https://github.com/CrowCpp/Crow.git
