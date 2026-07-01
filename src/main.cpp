@@ -331,15 +331,19 @@ int main() {
         if (testerName.empty()) return err("tester is required");
         if (methodName.empty()) return err("method is required");
 
-        // Build client
-        OpenHABClient client("https://myopenhab.org");
-        try {
-            client = makeClient(body);
-        } catch (const std::exception& e) {
-            return err(std::string("Connection config error: ") + e.what());
-        }
+        // Build client — direct initialisation via move constructor.
+        // OpenHABClient's copy-assignment and copy-constructor are both deleted.
+        // makeClient() returns by value; the move constructor transports it here.
+        OpenHABClient client = [&]() -> OpenHABClient {
+            try { return makeClient(body); }
+            catch (const std::exception& e) {
+                throw std::runtime_error(
+                    std::string("Connection config error: ") + e.what());
+            }
+        }();
         if (!client.isLoggedIn())
             return err("Could not connect to openHAB — check credentials", 401);
+
 
         // Dispatch
         try {
