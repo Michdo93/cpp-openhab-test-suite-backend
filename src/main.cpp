@@ -1,17 +1,19 @@
 /**
  * cpp-openhab-test-suite-backend
  * ───────────────────────────────
- * Stateless Crow HTTP server that proxies test-suite calls
- * from the GitHub Pages frontend to openHAB.
+ * HTTP backend using cpp-httplib (header-only, no Crow/asio dependency).
+ * Replaces the previous Crow-based implementation which had unreliable
+ * CORS handling on OPTIONS preflight requests.
  *
  * Endpoints
- * ─────────
  *   GET  /             → health / wake-up
- *   POST /api/connect  → verify credentials  → { loggedIn, isCloud }
- *   POST /api/test     → run tester method   → { result, output }
+ *   POST /api/connect  → verify credentials → { loggedIn, isCloud }
+ *   POST /api/test     → run tester method  → { result, output }
  */
 
-#include "crow.h"
+#define CPPHTTPLIB_OPENSSL_SUPPORT 0
+#include "httplib.h"
+
 #include <openhab/openhab.h>
 #include <openhab/testsuite.h>
 #include <nlohmann/json.hpp>
@@ -19,264 +21,224 @@
 #include <sstream>
 #include <iostream>
 #include <string>
-#include <functional>
 #include <stdexcept>
 #include <cstdlib>
+#include <unistd.h>
 
 using json = nlohmann::json;
 using namespace openhab;
 using namespace openhab::testsuite;
 
-// ─── CORS middleware ──────────────────────────────────────────────────────────
+// ─── CORS ─────────────────────────────────────────────────────────────────────
 
-struct CORSMiddleware {
-    struct context {};
-    void before_handle(crow::request&, crow::response& res, context&) { addCors(res); }
-    void after_handle (crow::request&, crow::response& res, context&) { addCors(res); }
-    static void addCors(crow::response& res) {
-        res.set_header("Access-Control-Allow-Origin",  "*");
-        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    }
-};
+static void setCORS(httplib::Response& res) {
+    res.set_header("Access-Control-Allow-Origin",  "*");
+    res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+}
 
 // ─── Response helpers ─────────────────────────────────────────────────────────
 
-static crow::response ok(const json& j) {
-    crow::response r(j.dump());
-    r.set_header("Content-Type", "application/json");
-    return r;
+static void respond_ok(httplib::Response& res, const json& j) {
+    setCORS(res);
+    res.set_content(j.dump(), "application/json");
 }
-static crow::response err(const std::string& msg, int code = 400) {
-    crow::response r(code, json{{"error", msg}}.dump());
-    r.set_header("Content-Type", "application/json");
-    return r;
+
+static void respond_err(httplib::Response& res, const std::string& msg, int code = 400) {
+    setCORS(res);
+    res.status = code;
+    res.set_content(json{{"error", msg}}.dump(), "application/json");
 }
 
 // ─── Client factory ───────────────────────────────────────────────────────────
 
 static OpenHABClient makeClient(const json& body) {
-    std::string url      = body.value("url",      "");
-    std::string username = body.value("username", "");
-    std::string password = body.value("password", "");
-    std::string token    = body.value("token",    "");
+    std::string url  = body.value("url",      "");
+    std::string user = body.value("username", "");
+    std::string pass = body.value("password", "");
+    std::string tok  = body.value("token",    "");
     if (url.empty()) throw std::invalid_argument("url is required");
     while (!url.empty() && url.back() == '/') url.pop_back();
-    return OpenHABClient(url, username, password, token);
+    // Normalize: add http:// if no protocol given
+    if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0)
+        url = "http://" + url;
+    return OpenHABClient(url, user, pass, tok);
 }
 
 // ─── Output capture ───────────────────────────────────────────────────────────
-/**
- * Redirect std::cout and std::cerr into a string buffer
- * for the duration of the tester call so diagnostic messages
- * are returned as "output" in the response.
- */
-struct OutputCapture {
-    std::ostringstream buf;
-    std::streambuf*    oldCout;
-    std::streambuf*    oldCerr;
 
-    OutputCapture() {
-        oldCout = std::cout.rdbuf(buf.rdbuf());
-        oldCerr = std::cerr.rdbuf(buf.rdbuf());
+struct Capture {
+    std::ostringstream buf;
+    std::streambuf*    oldOut;
+    std::streambuf*    oldErr;
+    Capture() {
+        oldOut = std::cout.rdbuf(buf.rdbuf());
+        oldErr = std::cerr.rdbuf(buf.rdbuf());
     }
-    ~OutputCapture() {
-        std::cout.rdbuf(oldCout);
-        std::cerr.rdbuf(oldCerr);
+    ~Capture() {
+        std::cout.rdbuf(oldOut);
+        std::cerr.rdbuf(oldErr);
     }
     std::string str() const { return buf.str(); }
 };
 
-// ─── Tester dispatch ──────────────────────────────────────────────────────────
-/**
- * Run a single tester method given the parsed request body.
- * Returns { result, output }.
- *
- * All tester classes share the constructor signature Tester(OpenHABClient&),
- * so we instantiate each one and call the method by name with the supplied params.
- *
- * Parameters are passed as a JSON array; each element is converted to the
- * appropriate C++ type by position (string, bool, int).
- */
-static json dispatch(OpenHABClient& client,
-                     const std::string& testerName,
-                     const std::string& methodName,
-                     const json& params) {
+// ─── Parameter helpers ────────────────────────────────────────────────────────
 
-    // Helper to safely extract a string param
-    auto str = [&](int i, const std::string& def = "") -> std::string {
-        if (i < (int)params.size() && !params[i].is_null())
-            return params[i].is_string() ? params[i].get<std::string>()
-                                         : params[i].dump();
-        return def;
-    };
-    auto boolP = [&](int i, bool def = false) -> bool {
-        if (i < (int)params.size()) {
-            if (params[i].is_boolean()) return params[i].get<bool>();
-            auto s = params[i].is_string() ? params[i].get<std::string>() : params[i].dump();
-            return s == "true" || s == "1";
-        }
-        return def;
-    };
-    auto intP = [&](int i, int def = 10) -> int {
-        if (i < (int)params.size()) {
-            if (params[i].is_number()) return params[i].get<int>();
-            try { return std::stoi(params[i].get<std::string>()); } catch (...) {}
-        }
-        return def;
-    };
+static std::string sp(const json& p, int i, const std::string& def = "") {
+    if (i < (int)p.size() && !p[i].is_null())
+        return p[i].is_string() ? p[i].get<std::string>() : p[i].dump();
+    return def;
+}
+static int ip(const json& p, int i, int def = 10) {
+    if (i < (int)p.size()) {
+        if (p[i].is_number()) return p[i].get<int>();
+        try { return std::stoi(sp(p, i)); } catch (...) {}
+    }
+    return def;
+}
 
+// ─── Dispatch ─────────────────────────────────────────────────────────────────
+
+static json dispatch(OpenHABClient& c,
+                     const std::string& tester,
+                     const std::string& method,
+                     const json& p) {
     json result = false;
     std::string output;
 
-    auto run = [&](auto callable) {
-        OutputCapture cap;
-        result = callable();
+    auto run_bool = [&](auto fn) {
+        Capture cap;
+        result = (fn() != 0);
         output = cap.str();
     };
+    auto run_str = [&](auto fn) {
+        Capture cap;
+        auto r  = fn();
+        result  = r.dump();
+        output  = cap.str();
+    };
 
-    // ── ItemTester ────────────────────────────────────────────────────────────
-    if (testerName == "ItemTester") {
-        ItemTester t(client);
-        if      (methodName == "doesItemExist")
-            run([&]{ return t.doesItemExist(str(0)); });
-        else if (methodName == "checkItemIsType")
-            run([&]{ return t.checkItemIsType(str(0), str(1)); });
-        else if (methodName == "checkItemHasState")
-            run([&]{ return t.checkItemHasState(str(0), str(1)); });
-        else if (methodName == "isGroupItem")
-            run([&]{ return t.isGroupItem(str(0)); });
-        else if (methodName == "doesGroupContainMember")
-            run([&]{ return t.doesGroupContainMember(str(0), str(1)); });
-        else if (methodName == "checkGroupMemberState")
-            run([&]{ return t.checkGroupMemberState(str(0), str(1), str(2)); });
-        else if (methodName == "testSwitch")
-            run([&]{ return t.testSwitch(str(0), str(1), str(2), intP(3)); });
-        else if (methodName == "testContact")
-            run([&]{ return t.testContact(str(0), str(1), str(2), intP(3)); });
-        else if (methodName == "testColor")
-            run([&]{ return t.testColor(str(0), str(1), str(2), intP(3)); });
-        else if (methodName == "testDimmer")
-            run([&]{ return t.testDimmer(str(0), str(1), str(2), intP(3)); });
-        else if (methodName == "testRollershutter")
-            run([&]{ return t.testRollershutter(str(0), str(1), str(2), intP(3)); });
-        else if (methodName == "testNumber")
-            run([&]{ return t.testNumber(str(0), str(1), str(2), intP(3)); });
-        else if (methodName == "testPlayer")
-            run([&]{ return t.testPlayer(str(0), str(1), str(2), intP(3)); });
-        else if (methodName == "testDateTime")
-            run([&]{ return t.testDateTime(str(0), str(1), str(2), intP(3)); });
-        else if (methodName == "testLocation")
-            run([&]{ return t.testLocation(str(0), str(1), str(2), intP(3)); });
-        else if (methodName == "testImage")
-            run([&]{ return t.testImage(str(0), str(1), str(2), intP(3)); });
-        else if (methodName == "testString")
-            run([&]{ return t.testString(str(0), str(1), str(2), intP(3)); });
-        else if (methodName == "getGroupMembers") {
-            OutputCapture cap;
-            result = t.getGroupMembers(str(0));
+    if (tester == "ItemTester") {
+        ItemTester t(c);
+        if      (method == "doesItemExist")
+            run_bool([&]{ return t.doesItemExist(sp(p,0)); });
+        else if (method == "checkItemIsType")
+            run_bool([&]{ return t.checkItemIsType(sp(p,0), sp(p,1)); });
+        else if (method == "checkItemHasState")
+            run_bool([&]{ return t.checkItemHasState(sp(p,0), sp(p,1)); });
+        else if (method == "isGroupItem")
+            run_bool([&]{ return t.isGroupItem(sp(p,0)); });
+        else if (method == "doesGroupContainMember")
+            run_bool([&]{ return t.doesGroupContainMember(sp(p,0), sp(p,1)); });
+        else if (method == "checkGroupMemberState")
+            run_bool([&]{ return t.checkGroupMemberState(sp(p,0), sp(p,1), sp(p,2)); });
+        else if (method == "getGroupMembers") {
+            Capture cap;
+            result = t.getGroupMembers(sp(p,0));
             output = cap.str();
         }
-        else throw std::invalid_argument("Unknown ItemTester method: " + methodName);
+        else if (method == "testSwitch")
+            run_bool([&]{ return t.testSwitch(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
+        else if (method == "testContact")
+            run_bool([&]{ return t.testContact(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
+        else if (method == "testColor")
+            run_bool([&]{ return t.testColor(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
+        else if (method == "testDimmer")
+            run_bool([&]{ return t.testDimmer(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
+        else if (method == "testRollershutter")
+            run_bool([&]{ return t.testRollershutter(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
+        else if (method == "testNumber")
+            run_bool([&]{ return t.testNumber(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
+        else if (method == "testPlayer")
+            run_bool([&]{ return t.testPlayer(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
+        else if (method == "testDateTime")
+            run_bool([&]{ return t.testDateTime(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
+        else if (method == "testLocation")
+            run_bool([&]{ return t.testLocation(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
+        else if (method == "testImage")
+            run_bool([&]{ return t.testImage(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
+        else if (method == "testString")
+            run_bool([&]{ return t.testString(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
+        else throw std::invalid_argument("Unknown ItemTester method: " + method);
     }
-    // ── ThingTester ───────────────────────────────────────────────────────────
-    else if (testerName == "ThingTester") {
-        ThingTester t(client);
-        if      (methodName == "getThingStatus") {
-            OutputCapture cap;
-            result = t.getThingStatus(str(0));
+    else if (tester == "ThingTester") {
+        ThingTester t(c);
+        if      (method == "getThingStatus") {
+            Capture cap;
+            result = t.getThingStatus(sp(p,0));
             output = cap.str();
         }
-        else if (methodName == "isThingStatus")
-            run([&]{ return t.isThingStatus(str(0), str(1)); });
-        else if (methodName == "isThingOnline")
-            run([&]{ return t.isThingOnline(str(0)); });
-        else if (methodName == "isThingOffline")
-            run([&]{ return t.isThingOffline(str(0)); });
-        else if (methodName == "isThingPending")
-            run([&]{ return t.isThingPending(str(0)); });
-        else if (methodName == "isThingUnknown")
-            run([&]{ return t.isThingUnknown(str(0)); });
-        else if (methodName == "isThingUninitialized")
-            run([&]{ return t.isThingUninitialized(str(0)); });
-        else if (methodName == "isThingError")
-            run([&]{ return t.isThingError(str(0)); });
-        else if (methodName == "enableThing")
-            run([&]{ return t.enableThing(str(0)); });
-        else if (methodName == "disableThing")
-            run([&]{ return t.disableThing(str(0)); });
-        else throw std::invalid_argument("Unknown ThingTester method: " + methodName);
+        else if (method == "isThingStatus")
+            run_bool([&]{ return t.isThingStatus(sp(p,0), sp(p,1)); });
+        else if (method == "isThingOnline")       run_bool([&]{ return t.isThingOnline(sp(p,0)); });
+        else if (method == "isThingOffline")      run_bool([&]{ return t.isThingOffline(sp(p,0)); });
+        else if (method == "isThingPending")      run_bool([&]{ return t.isThingPending(sp(p,0)); });
+        else if (method == "isThingUnknown")      run_bool([&]{ return t.isThingUnknown(sp(p,0)); });
+        else if (method == "isThingUninitialized")run_bool([&]{ return t.isThingUninitialized(sp(p,0)); });
+        else if (method == "isThingError")        run_bool([&]{ return t.isThingError(sp(p,0)); });
+        else if (method == "enableThing")         run_bool([&]{ return t.enableThing(sp(p,0)); });
+        else if (method == "disableThing")        run_bool([&]{ return t.disableThing(sp(p,0)); });
+        else throw std::invalid_argument("Unknown ThingTester method: " + method);
     }
-    // ── RuleTester ────────────────────────────────────────────────────────────
-    else if (testerName == "RuleTester") {
-        RuleTester t(client);
-        if      (methodName == "getRuleStatus") {
-            OutputCapture cap;
-            result = t.getRuleStatus(str(0));
+    else if (tester == "RuleTester") {
+        RuleTester t(c);
+        if      (method == "getRuleStatus") {
+            Capture cap;
+            result = t.getRuleStatus(sp(p,0));
             output = cap.str();
         }
-        else if (methodName == "isRuleActive")
-            run([&]{ return t.isRuleActive(str(0)); });
-        else if (methodName == "isRuleDisabled")
-            run([&]{ return t.isRuleDisabled(str(0)); });
-        else if (methodName == "isRuleRunning")
-            run([&]{ return t.isRuleRunning(str(0)); });
-        else if (methodName == "isRuleIdle")
-            run([&]{ return t.isRuleIdle(str(0)); });
-        else if (methodName == "enableRule")
-            run([&]{ return t.enableRule(str(0)); });
-        else if (methodName == "disableRule")
-            run([&]{ return t.disableRule(str(0)); });
-        else if (methodName == "runRule")
-            run([&]{ return t.runRule(str(0)); });
-        else if (methodName == "testRuleExecution")
-            run([&]{ return t.testRuleExecution(str(0), str(1), str(2)); });
-        else throw std::invalid_argument("Unknown RuleTester method: " + methodName);
+        else if (method == "isRuleActive")   run_bool([&]{ return t.isRuleActive(sp(p,0)); });
+        else if (method == "isRuleDisabled") run_bool([&]{ return t.isRuleDisabled(sp(p,0)); });
+        else if (method == "isRuleRunning")  run_bool([&]{ return t.isRuleRunning(sp(p,0)); });
+        else if (method == "isRuleIdle")     run_bool([&]{ return t.isRuleIdle(sp(p,0)); });
+        else if (method == "enableRule")     run_bool([&]{ return t.enableRule(sp(p,0)); });
+        else if (method == "disableRule")    run_bool([&]{ return t.disableRule(sp(p,0)); });
+        else if (method == "runRule")        run_bool([&]{ return t.runRule(sp(p,0)); });
+        else if (method == "testRuleExecution")
+            run_bool([&]{ return t.testRuleExecution(sp(p,0), sp(p,1), sp(p,2)); });
+        else throw std::invalid_argument("Unknown RuleTester method: " + method);
     }
-    // ── ChannelTester ─────────────────────────────────────────────────────────
-    else if (testerName == "ChannelTester") {
-        ChannelTester t(client);
-        if      (methodName == "isItemLinkedToChannel")
-            run([&]{ return t.isItemLinkedToChannel(str(0), str(1)); });
-        else if (methodName == "getLinksForItem") {
-            OutputCapture cap;
-            result = t.getLinksForItem(str(0));
+    else if (tester == "ChannelTester") {
+        ChannelTester t(c);
+        if      (method == "isItemLinkedToChannel")
+            run_bool([&]{ return t.isItemLinkedToChannel(sp(p,0), sp(p,1)); });
+        else if (method == "getLinksForItem") {
+            Capture cap;
+            result = t.getLinksForItem(sp(p,0));
             output = cap.str();
         }
-        else if (methodName == "isItemLinkedToAnyChannel")
-            run([&]{ return t.isItemLinkedToAnyChannel(str(0)); });
-        else if (methodName == "hasOrphanedLinks")
-            run([&]{ return t.hasOrphanedLinks(); });
-        else throw std::invalid_argument("Unknown ChannelTester method: " + methodName);
+        else if (method == "isItemLinkedToAnyChannel")
+            run_bool([&]{ return t.isItemLinkedToAnyChannel(sp(p,0)); });
+        else if (method == "hasOrphanedLinks")
+            run_bool([&]{ return t.hasOrphanedLinks(); });
+        else throw std::invalid_argument("Unknown ChannelTester method: " + method);
     }
-    // ── PersistenceTester ─────────────────────────────────────────────────────
-    else if (testerName == "PersistenceTester") {
-        PersistenceTester t(client);
-        if      (methodName == "isItemPersisted")
-            run([&]{ return t.isItemPersisted(str(0), str(1)); });
-        else if (methodName == "hasDataInRange")
-            run([&]{ return t.hasDataInRange(str(0), str(1), str(2), str(3)); });
-        else if (methodName == "checkLastPersistedState")
-            run([&]{ return t.checkLastPersistedState(str(0), str(1), str(2)); });
-        else throw std::invalid_argument("Unknown PersistenceTester method: " + methodName);
+    else if (tester == "PersistenceTester") {
+        PersistenceTester t(c);
+        if      (method == "isItemPersisted")
+            run_bool([&]{ return t.isItemPersisted(sp(p,0), sp(p,1)); });
+        else if (method == "hasDataInRange")
+            run_bool([&]{ return t.hasDataInRange(sp(p,0), sp(p,1), sp(p,2), sp(p,3)); });
+        else if (method == "checkLastPersistedState")
+            run_bool([&]{ return t.checkLastPersistedState(sp(p,0), sp(p,1), sp(p,2)); });
+        else throw std::invalid_argument("Unknown PersistenceTester method: " + method);
     }
-    // ── SitemapTester ─────────────────────────────────────────────────────────
-    else if (testerName == "SitemapTester") {
-        SitemapTester t(client);
-        if      (methodName == "doesSitemapExist")
-            run([&]{ return t.doesSitemapExist(str(0)); });
-        else if (methodName == "doesSitemapContainItem")
-            run([&]{ return t.doesSitemapContainItem(str(0), str(1)); });
-        else throw std::invalid_argument("Unknown SitemapTester method: " + methodName);
+    else if (tester == "SitemapTester") {
+        SitemapTester t(c);
+        if      (method == "doesSitemapExist")
+            run_bool([&]{ return t.doesSitemapExist(sp(p,0)); });
+        else if (method == "doesSitemapContainItem")
+            run_bool([&]{ return t.doesSitemapContainItem(sp(p,0), sp(p,1)); });
+        else throw std::invalid_argument("Unknown SitemapTester method: " + method);
     }
     else {
         throw std::invalid_argument(
-            "Unknown tester '" + testerName + "'. Valid: ItemTester, ThingTester, "
+            "Unknown tester '" + tester + "'. Valid: ItemTester, ThingTester, "
             "RuleTester, ChannelTester, PersistenceTester, SitemapTester");
     }
 
-    // Trim trailing newlines from output
-    while (!output.empty() && (output.back() == '\n' || output.back() == '\r'))
+    while (!output.empty() &&
+           (output.back() == '\n' || output.back() == '\r' || output.back() == ' '))
         output.pop_back();
 
     return json{{"result", result}, {"output", output}};
@@ -286,63 +248,48 @@ static json dispatch(OpenHABClient& client,
 
 int main() {
     const char* portEnv = std::getenv("PORT");
-    uint16_t port = portEnv ? static_cast<uint16_t>(std::stoi(portEnv)) : 8080;
+    int port = portEnv ? std::stoi(portEnv) : 8080;
 
-    crow::App<CORSMiddleware> app;
-    app.loglevel(crow::LogLevel::Warning);
+    httplib::Server svr;
 
-    // ── CORS preflight — explicit routes for every endpoint ──────────────────
-    // Crow's wildcard route /<path> misses the root "/" and can be unreliable
-    // for preflight OPTIONS across versions. Explicit routes are more robust.
-    auto corsHandler = [](const crow::request&, crow::response& res, const std::string&) {
-        CORSMiddleware::addCors(res);
-        res.code = 204;
-        res.end();
-    };
-    CROW_ROUTE(app, "/")                .methods(crow::HTTPMethod::OPTIONS)([](){
-        crow::response res(204); CORSMiddleware::addCors(res); return res; });
-    CROW_ROUTE(app, "/api/connect")     .methods(crow::HTTPMethod::OPTIONS)([](){
-        crow::response res(204); CORSMiddleware::addCors(res); return res; });
-    CROW_ROUTE(app, "/api/test")        .methods(crow::HTTPMethod::OPTIONS)([](){
-        crow::response res(204); CORSMiddleware::addCors(res); return res; });
-    CROW_ROUTE(app, "/<path>")          .methods(crow::HTTPMethod::OPTIONS)(corsHandler);
+    // CORS preflight — regex ".*" matches every path reliably
+    svr.Options(".*", [](const httplib::Request&, httplib::Response& res) {
+        setCORS(res);
+        res.status = 204;
+    });
 
-    // Health check / wake-up
-    CROW_ROUTE(app, "/").methods(crow::HTTPMethod::GET)
-    ([]() -> crow::response {
-        return ok({{"status","ok"},{"service","cpp-openhab-test-suite-backend"}});
+    // Health check
+    svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
+        respond_ok(res, {{"status","ok"},
+                         {"service","cpp-openhab-test-suite-backend"}});
     });
 
     // POST /api/connect
-    CROW_ROUTE(app, "/api/connect").methods(crow::HTTPMethod::POST)
-    ([](const crow::request& req) -> crow::response {
+    svr.Post("/api/connect", [](const httplib::Request& req, httplib::Response& res) {
         try {
             auto body = json::parse(req.body);
             auto c    = makeClient(body);
-            return ok({{"loggedIn", c.isLoggedIn()},
-                       {"isCloud",  c.isCloud()}});
+            respond_ok(res, {{"loggedIn", c.isLoggedIn()},
+                             {"isCloud",  c.isCloud()}});
         } catch (const std::exception& e) {
-            return ok({{"loggedIn",false},{"isCloud",false},{"error",e.what()}});
+            respond_ok(res, {{"loggedIn",false},{"isCloud",false},{"error",e.what()}});
         }
     });
 
     // POST /api/test
-    CROW_ROUTE(app, "/api/test").methods(crow::HTTPMethod::POST)
-    ([](const crow::request& req) -> crow::response {
+    svr.Post("/api/test", [](const httplib::Request& req, httplib::Response& res) {
         json body;
         try { body = json::parse(req.body); }
-        catch (...) { return err("Invalid JSON body"); }
+        catch (...) { respond_err(res, "Invalid JSON body"); return; }
 
-        std::string testerName = body.value("tester","");
-        std::string methodName = body.value("method","");
-        json params            = body.value("params", json::array());
+        std::string tester = body.value("tester", "");
+        std::string method = body.value("method", "");
+        json params        = body.value("params", json::array());
 
-        if (testerName.empty()) return err("tester is required");
-        if (methodName.empty()) return err("method is required");
+        if (tester.empty()) { respond_err(res, "tester is required"); return; }
+        if (method.empty()) { respond_err(res, "method is required"); return; }
 
-        // Build client — direct initialisation via move constructor.
-        // OpenHABClient's copy-assignment and copy-constructor are both deleted.
-        // makeClient() returns by value; the move constructor transports it here.
+        // Build client via move constructor (copy-assignment/ctor are deleted)
         OpenHABClient client = [&]() -> OpenHABClient {
             try { return makeClient(body); }
             catch (const std::exception& e) {
@@ -350,24 +297,26 @@ int main() {
                     std::string("Connection config error: ") + e.what());
             }
         }();
-        if (!client.isLoggedIn())
-            return err("Could not connect to openHAB — check credentials", 401);
 
+        if (!client.isLoggedIn()) {
+            respond_err(res,
+                "Could not connect to openHAB — check URL and credentials", 401);
+            return;
+        }
 
-        // Dispatch
         try {
-            auto result = dispatch(client, testerName, methodName, params);
-            return ok(result);
+            auto result = dispatch(client, tester, method, params);
+            respond_ok(res, result);
         } catch (const std::invalid_argument& e) {
-            return err(e.what(), 400);
+            respond_err(res, e.what(), 400);
         } catch (const OpenHABException& e) {
-            return err(std::string("openHAB error: ") + e.what(), 502);
+            respond_err(res, std::string("openHAB error: ") + e.what(), 502);
         } catch (const std::exception& e) {
-            return err(e.what(), 500);
+            respond_err(res, e.what(), 500);
         }
     });
 
     std::cout << "cpp-openhab-test-suite-backend running on port " << port << "\n";
-    app.port(port).multithreaded().run();
+    svr.listen("0.0.0.0", port);
     return 0;
 }

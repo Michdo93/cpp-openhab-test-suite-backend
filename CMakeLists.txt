@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ── Dependencies ───────────────────────────────────────────────────────────────
 
 find_package(CURL REQUIRED)
+find_package(Threads REQUIRED)
 
 # nlohmann/json
 find_package(nlohmann_json 3.2.0 QUIET)
@@ -18,24 +19,17 @@ if(NOT nlohmann_json_FOUND)
   FetchContent_MakeAvailable(json)
 endif()
 
-# Crow – lightweight C++ HTTP server (header-only)
-# Instruct Crow to use the system-installed Asio (libasio-dev) rather than
-# trying to find Boost.Asio, and disable SSL so we don't need libssl linkage.
-set(CROW_USE_BOOST      OFF CACHE BOOL "" FORCE)
-set(CROW_ENABLE_SSL     OFF CACHE BOOL "" FORCE)
-set(ASIO_INCLUDE_DIR    /usr/include CACHE PATH "" FORCE)
-
+# cpp-httplib (header-only — replaces Crow; no asio/boost dependency at all)
 include(FetchContent)
-FetchContent_Declare(crow
-  GIT_REPOSITORY https://github.com/CrowCpp/Crow.git
-  GIT_TAG        v1.2.0)
-FetchContent_MakeAvailable(crow)
+FetchContent_Declare(httplib
+  GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+  GIT_TAG        v0.15.3)
+FetchContent_MakeAvailable(httplib)
 
-# cpp-openhab-rest-client (git submodule in extern/)
+# cpp-openhab-rest-client (git submodule)
 add_subdirectory(extern/cpp-openhab-rest-client)
 
-# cpp-openhab-test-suite headers (git submodule in extern/)
-# It is header-only, so we just add its include directory directly.
+# cpp-openhab-test-suite (header-only, git submodule)
 set(TEST_SUITE_INCLUDE
     "${CMAKE_CURRENT_SOURCE_DIR}/extern/cpp-openhab-test-suite/include")
 
@@ -47,11 +41,8 @@ target_include_directories(openhab_test_suite_backend PRIVATE
   ${TEST_SUITE_INCLUDE})
 
 target_link_libraries(openhab_test_suite_backend PRIVATE
-  Crow::Crow
   openhab_rest_client_static
+  httplib::httplib
   ${CURL_LIBRARIES}
-  nlohmann_json::nlohmann_json)
-
-if(UNIX)
-  target_link_libraries(openhab_test_suite_backend PRIVATE pthread)
-endif()
+  nlohmann_json::nlohmann_json
+  Threads::Threads)
