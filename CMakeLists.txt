@@ -1,48 +1,36 @@
 cmake_minimum_required(VERSION 3.16)
-project(OpenHABTestSuiteBackend VERSION 1.0.0 LANGUAGES CXX)
+project(OpenHABTestSuiteBackendCpp VERSION 2.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ── Dependencies ───────────────────────────────────────────────────────────────
+include(FetchContent)
+set(OPENHAB_REST_CLIENT_DIR "" CACHE PATH "Source directory of cpp-openhab-rest-client (optional)")
+set(OPENHAB_TEST_SUITE_DIR "" CACHE PATH "Source directory of cpp-openhab-test-suite (optional)")
 
-find_package(CURL REQUIRED)
-find_package(Threads REQUIRED)
-
-# nlohmann/json
-find_package(nlohmann_json 3.2.0 QUIET)
-if(NOT nlohmann_json_FOUND)
-  include(FetchContent)
-  FetchContent_Declare(json
-    URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-  FetchContent_MakeAvailable(json)
+# cpp-openhab-test-suite 2.0.0 – fetches cpp-openhab-rest-client 2.0.0 (nlohmann/json, libcurl) itself
+set(OPENHAB_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(OPENHAB_TESTSUITE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+if(OPENHAB_REST_CLIENT_DIR)
+  add_subdirectory(${OPENHAB_REST_CLIENT_DIR} cpp-openhab-rest-client)
+endif()
+if(OPENHAB_TEST_SUITE_DIR)
+  add_subdirectory(${OPENHAB_TEST_SUITE_DIR} cpp-openhab-test-suite)
+else()
+  FetchContent_Declare(cpp_openhab_test_suite
+    GIT_REPOSITORY https://github.com/Michdo93/cpp-openhab-test-suite.git
+    GIT_TAG        3e4030d6807f7920f9a1d75dfc7c4330cfbd0396)   # 2.0.0
+  FetchContent_MakeAvailable(cpp_openhab_test_suite)
 endif()
 
-# cpp-httplib (header-only — replaces Crow; no asio/boost dependency at all)
-include(FetchContent)
+# cpp-httplib (header only, no OpenSSL needed – Render terminates TLS)
 FetchContent_Declare(httplib
   GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
-  GIT_TAG        v0.15.3)
+  GIT_TAG        v0.18.3)
 FetchContent_MakeAvailable(httplib)
 
-# cpp-openhab-rest-client (git submodule)
-add_subdirectory(extern/cpp-openhab-rest-client)
-
-# cpp-openhab-test-suite (header-only, git submodule)
-set(TEST_SUITE_INCLUDE
-    "${CMAKE_CURRENT_SOURCE_DIR}/extern/cpp-openhab-test-suite/include")
-
-# ── Backend executable ─────────────────────────────────────────────────────────
+find_package(Threads REQUIRED)
 
 add_executable(openhab_test_suite_backend src/main.cpp)
-
-target_include_directories(openhab_test_suite_backend PRIVATE
-  ${TEST_SUITE_INCLUDE})
-
-target_link_libraries(openhab_test_suite_backend PRIVATE
-  openhab_rest_client_static
-  httplib::httplib
-  ${CURL_LIBRARIES}
-  nlohmann_json::nlohmann_json
-  Threads::Threads)
+target_link_libraries(openhab_test_suite_backend PRIVATE openhab::test_suite_cpp httplib::httplib
+                      Threads::Threads)

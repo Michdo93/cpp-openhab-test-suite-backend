@@ -1,330 +1,234 @@
-/**
- * cpp-openhab-test-suite-backend
- * ───────────────────────────────
- * HTTP backend using cpp-httplib (header-only, no Crow/asio dependency).
- * Replaces the previous Crow-based implementation which had unreliable
- * CORS handling on OPTIONS preflight requests.
- *
- * Endpoints
- *   GET  /             → health / wake-up
- *   POST /api/connect  → verify credentials → { loggedIn, isCloud }
- *   POST /api/test     → run tester method  → { result, output }
- */
-
-#define CPPHTTPLIB_OPENSSL_SUPPORT 0
+// Backend of the cpp-openhab-test-suite test app: runs the testers of the C++ library on
+// behalf of the browser.
+//
+//   GET  /             health check (wake-up on Render)
+//   POST /api/connect  {url, token | username+password}            -> {loggedIn, isCloud, url}
+//   POST /api/test     {url, token, ..., tester, method, params: [...]} -> {result, output}
+//
+// params are positional as in the Python suite. The test… methods take
+// [itemName, command, expectedState, timeout]; expectedState may also be a list of
+// accepted states.
 #include "httplib.h"
 
-#include <openhab/openhab.h>
-#include <openhab/testsuite.h>
-#include <nlohmann/json.hpp>
+#include <openhab/testsuite.hpp>
 
-#include <sstream>
-#include <iostream>
-#include <string>
-#include <stdexcept>
 #include <cstdlib>
-#include <unistd.h>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
 
-using json = nlohmann::json;
-using namespace openhab;
-using namespace openhab::testsuite;
+using openhab::json;
+namespace ts = openhab::testsuite;
 
-// ─── CORS ─────────────────────────────────────────────────────────────────────
+namespace {
 
-static void setCORS(httplib::Response& res) {
-    res.set_header("Access-Control-Allow-Origin",  "*");
+// ── Messages of the testers: collected per request ───────────────────────────
+// setLog() is global, so tests run one after another.
+std::mutex testMutex;
+std::string testOutput;
+
+void setCORS(httplib::Response& res) {
+    res.set_header("Access-Control-Allow-Origin", "*");
     res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.set_header("Access-Control-Allow-Headers", "Content-Type");
 }
 
-// ─── Response helpers ─────────────────────────────────────────────────────────
-
-static void respond_ok(httplib::Response& res, const json& j) {
+void sendJson(httplib::Response& res, const json& value, int status = 200) {
     setCORS(res);
-    res.set_content(j.dump(), "application/json");
+    res.status = status;
+    res.set_content(value.dump(), "application/json");
 }
 
-static void respond_err(httplib::Response& res, const std::string& msg, int code = 400) {
-    setCORS(res);
-    res.status = code;
-    res.set_content(json{{"error", msg}}.dump(), "application/json");
+void sendError(httplib::Response& res, const std::string& msg, int status) {
+    sendJson(res, json{{"error", msg}}, status);
 }
 
-// ─── Client factory ───────────────────────────────────────────────────────────
-
-static std::string jsonStr(const json& body, const std::string& key) {
-    // body.value(key, "") throws type_error.302 when the field exists but is
-    // JSON null (frontend sends null for empty optional fields). Handle both
-    // "absent" and "null" gracefully by returning an empty string.
-    if (!body.contains(key) || body[key].is_null()) return "";
-    return body[key].get<std::string>();
+std::optional<std::string> opt(const json& body, const char* key) {
+    std::string s = openhab::str(body, key);
+    return s.empty() ? std::nullopt : std::optional<std::string>(s);
 }
 
-static OpenHABClient makeClient(const json& body) {
-    std::string url  = jsonStr(body, "url");
-    std::string user = jsonStr(body, "username");
-    std::string pass = jsonStr(body, "password");
-    std::string tok  = jsonStr(body, "token");
-    if (url.empty()) throw std::invalid_argument("url is required");
-    while (!url.empty() && url.back() == '/') url.pop_back();
-    // Normalize: add http:// if no protocol given
-    if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0)
-        url = "http://" + url;
-    return OpenHABClient(url, user, pass, tok);
+std::unique_ptr<openhab::OpenHABClient> makeClient(const json& body) {
+    openhab::ClientOptions o;
+    o.token = opt(body, "token");
+    o.username = opt(body, "username");
+    o.password = opt(body, "password");
+    std::string url = openhab::str(body, "url");
+    return std::make_unique<openhab::OpenHABClient>(url.empty() ? "https://myopenhab.org" : url, o);
 }
 
-// ─── Output capture ───────────────────────────────────────────────────────────
+// ── Parameters ────────────────────────────────────────────────────────────────
+struct Params {
+    json list;
 
-struct Capture {
-    std::ostringstream buf;
-    std::streambuf*    oldOut;
-    std::streambuf*    oldErr;
-    Capture() {
-        oldOut = std::cout.rdbuf(buf.rdbuf());
-        oldErr = std::cerr.rdbuf(buf.rdbuf());
+    const json& at(size_t i) const {
+        static const json none = nullptr;
+        return i < list.size() ? list[i] : none;
     }
-    ~Capture() {
-        std::cout.rdbuf(oldOut);
-        std::cerr.rdbuf(oldErr);
+    std::string s(size_t i) const {
+        const json& v = at(i);
+        if (v.is_string()) return v.get<std::string>();
+        if (v.is_number()) return v.dump();
+        return "";
     }
-    std::string str() const { return buf.str(); }
+    double num(size_t i, double def) const {
+        const json& v = at(i);
+        if (v.is_number()) return v.get<double>();
+        if (v.is_string() && !v.get<std::string>().empty()) return std::atof(v.get<std::string>().c_str());
+        return def;
+    }
+    // expectedState: one state, a list of accepted states or nothing
+    ts::ExpectedState expected(size_t i) const {
+        const json& v = at(i);
+        if (v.is_array()) {
+            std::vector<std::string> states;
+            for (const json& e : v) states.push_back(e.is_string() ? e.get<std::string>() : e.dump());
+            return ts::ExpectedState(states);
+        }
+        std::string t = s(i);
+        return t.empty() ? ts::ExpectedState() : ts::ExpectedState(t);
+    }
 };
 
-// ─── Parameter helpers ────────────────────────────────────────────────────────
+using Fn = std::function<json(openhab::OpenHABClient&, const Params&)>;
 
-static std::string sp(const json& p, int i, const std::string& def = "") {
-    if (i < (int)p.size() && !p[i].is_null())
-        return p[i].is_string() ? p[i].get<std::string>() : p[i].dump();
-    return def;
-}
-static int ip(const json& p, int i, int def = 10) {
-    if (i < (int)p.size()) {
-        if (p[i].is_number()) return p[i].get<int>();
-        try { return std::stoi(sp(p, i)); } catch (...) {}
-    }
-    return def;
-}
+#define I(expr) [](openhab::OpenHABClient& c, const Params& p) -> json { ts::ItemTester t(c); (void)p; return expr; }
+#define TH(expr) [](openhab::OpenHABClient& c, const Params& p) -> json { ts::ThingTester t(c); (void)p; return expr; }
+#define R(expr) [](openhab::OpenHABClient& c, const Params& p) -> json { ts::RuleTester t(c); (void)p; return expr; }
+#define CH(expr) [](openhab::OpenHABClient& c, const Params& p) -> json { ts::ChannelTester t(c); (void)p; return expr; }
+#define PE(expr) [](openhab::OpenHABClient& c, const Params& p) -> json { ts::PersistenceTester t(c); (void)p; return expr; }
+#define SI(expr) [](openhab::OpenHABClient& c, const Params& p) -> json { ts::SitemapTester t(c); (void)p; return expr; }
+#define TEST(name) I(t.name(p.s(0), p.s(1), p.expected(2), static_cast<int>(p.num(3, 10))))
 
-// ─── Dispatch ─────────────────────────────────────────────────────────────────
+const std::map<std::string, std::map<std::string, Fn>> TESTERS = {
+    {"ItemTester", {
+        {"doesItemExist", I(t.doesItemExist(p.s(0)))},
+        {"checkItemIsType", I(t.checkItemIsType(p.s(0), p.s(1)))},
+        {"checkItemHasState", I(t.checkItemHasState(p.s(0), p.s(1)))},
+        {"isGroupItem", I(t.isGroupItem(p.s(0)))},
+        {"getGroupMembers", I(t.getGroupMembers(p.s(0)))},
+        {"doesGroupContainMember", I(t.doesGroupContainMember(p.s(0), p.s(1)))},
+        {"checkGroupMemberState", I(t.checkGroupMemberState(p.s(0), p.s(1), p.s(2)))},
+        {"testColor", TEST(testColor)},
+        {"testContact", I(t.testContact(p.s(0), p.at(1).is_null() ? std::nullopt
+                                                                  : std::optional<std::string>(p.s(1)),
+                                         p.expected(2), static_cast<int>(p.num(3, 10))))},
+        {"testDateTime", TEST(testDateTime)},
+        {"testDimmer", TEST(testDimmer)},
+        {"testImage", TEST(testImage)},
+        {"testLocation", TEST(testLocation)},
+        {"testNumber", TEST(testNumber)},
+        {"testPlayer", TEST(testPlayer)},
+        {"testRollershutter", TEST(testRollershutter)},
+        {"testString", TEST(testString)},
+        {"testSwitch", TEST(testSwitch)},
+    }},
+    {"ThingTester", {
+        {"getThingStatus", TH(t.getThingStatus(p.s(0)))},
+        {"isThingStatus", TH(t.isThingStatus(p.s(0), p.s(1)))},
+        {"isThingOnline", TH(t.isThingOnline(p.s(0)))},
+        {"isThingOffline", TH(t.isThingOffline(p.s(0)))},
+        {"isThingPending", TH(t.isThingPending(p.s(0)))},
+        {"isThingUnknown", TH(t.isThingUnknown(p.s(0)))},
+        {"isThingUninitialized", TH(t.isThingUninitialized(p.s(0)))},
+        {"isThingError", TH(t.isThingError(p.s(0)))},
+        {"enableThing", TH(t.enableThing(p.s(0)))},
+        {"disableThing", TH(t.disableThing(p.s(0)))},
+    }},
+    {"RuleTester", {
+        {"runRule", R(t.runRule(p.s(0), p.at(1).is_object() ? p.at(1) : json()))},
+        {"enableRule", R(t.enableRule(p.s(0)))},
+        {"disableRule", R(t.disableRule(p.s(0)))},
+        {"testRuleExecution", R(t.testRuleExecution(p.s(0), p.s(1), p.s(2), p.num(3, 2.0)))},
+        {"isRuleActive", R(t.isRuleActive(p.s(0)))},
+        {"isRuleDisabled", R(t.isRuleDisabled(p.s(0)))},
+        {"isRuleRunning", R(t.isRuleRunning(p.s(0)))},
+        {"isRuleIdle", R(t.isRuleIdle(p.s(0)))},
+        {"getRuleStatus", R(t.getRuleStatus(p.s(0)))},
+    }},
+    {"ChannelTester", {
+        {"isItemLinkedToChannel", CH(t.isItemLinkedToChannel(p.s(0), p.s(1)))},
+        {"getLinksForItem", CH(t.getLinksForItem(p.s(0)))},
+        {"hasOrphanedLinks", CH(t.hasOrphanedLinks())},
+        {"isItemLinkedToAnyChannel", CH(t.isItemLinkedToAnyChannel(p.s(0)))},
+    }},
+    {"PersistenceTester", {
+        {"isItemPersisted", PE(t.isItemPersisted(p.s(0), p.s(1)))},
+        {"hasDataInRange", PE(t.hasDataInRange(p.s(0), p.s(1), p.s(2), p.s(3)))},
+        {"checkLastPersistedState", PE(t.checkLastPersistedState(p.s(0), p.s(1), p.s(2)))},
+    }},
+    {"SitemapTester", {
+        {"doesSitemapExist", SI(t.doesSitemapExist(p.s(0)))},
+        {"doesSitemapContainItem", SI(t.doesSitemapContainItem(p.s(0), p.s(1)))},
+    }},
+};
 
-static json dispatch(OpenHABClient& c,
-                     const std::string& tester,
-                     const std::string& method,
-                     const json& p) {
-    json result = false;
-    std::string output;
-
-    auto run_bool = [&](auto fn) {
-        Capture cap;
-        result = (fn() != 0);
-        output = cap.str();
-    };
-    auto run_str = [&](auto fn) {
-        Capture cap;
-        auto r  = fn();
-        result  = r.dump();
-        output  = cap.str();
-    };
-
-    if (tester == "ItemTester") {
-        ItemTester t(c);
-        if      (method == "doesItemExist")
-            run_bool([&]{ return t.doesItemExist(sp(p,0)); });
-        else if (method == "checkItemIsType")
-            run_bool([&]{ return t.checkItemIsType(sp(p,0), sp(p,1)); });
-        else if (method == "checkItemHasState")
-            run_bool([&]{ return t.checkItemHasState(sp(p,0), sp(p,1)); });
-        else if (method == "isGroupItem")
-            run_bool([&]{ return t.isGroupItem(sp(p,0)); });
-        else if (method == "doesGroupContainMember")
-            run_bool([&]{ return t.doesGroupContainMember(sp(p,0), sp(p,1)); });
-        else if (method == "checkGroupMemberState")
-            run_bool([&]{ return t.checkGroupMemberState(sp(p,0), sp(p,1), sp(p,2)); });
-        else if (method == "getGroupMembers") {
-            Capture cap;
-            result = t.getGroupMembers(sp(p,0));
-            output = cap.str();
-        }
-        else if (method == "testSwitch")
-            run_bool([&]{ return t.testSwitch(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
-        else if (method == "testContact")
-            run_bool([&]{ return t.testContact(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
-        else if (method == "testColor")
-            run_bool([&]{ return t.testColor(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
-        else if (method == "testDimmer")
-            run_bool([&]{ return t.testDimmer(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
-        else if (method == "testRollershutter")
-            run_bool([&]{ return t.testRollershutter(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
-        else if (method == "testNumber")
-            run_bool([&]{ return t.testNumber(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
-        else if (method == "testPlayer")
-            run_bool([&]{ return t.testPlayer(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
-        else if (method == "testDateTime")
-            run_bool([&]{ return t.testDateTime(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
-        else if (method == "testLocation")
-            run_bool([&]{ return t.testLocation(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
-        else if (method == "testImage")
-            run_bool([&]{ return t.testImage(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
-        else if (method == "testString")
-            run_bool([&]{ return t.testString(sp(p,0), sp(p,1), sp(p,2), ip(p,3)); });
-        else throw std::invalid_argument("Unknown ItemTester method: " + method);
-    }
-    else if (tester == "ThingTester") {
-        ThingTester t(c);
-        if      (method == "getThingStatus") {
-            Capture cap;
-            result = t.getThingStatus(sp(p,0));
-            output = cap.str();
-        }
-        else if (method == "isThingStatus")
-            run_bool([&]{ return t.isThingStatus(sp(p,0), sp(p,1)); });
-        else if (method == "isThingOnline")       run_bool([&]{ return t.isThingOnline(sp(p,0)); });
-        else if (method == "isThingOffline")      run_bool([&]{ return t.isThingOffline(sp(p,0)); });
-        else if (method == "isThingPending")      run_bool([&]{ return t.isThingPending(sp(p,0)); });
-        else if (method == "isThingUnknown")      run_bool([&]{ return t.isThingUnknown(sp(p,0)); });
-        else if (method == "isThingUninitialized")run_bool([&]{ return t.isThingUninitialized(sp(p,0)); });
-        else if (method == "isThingError")        run_bool([&]{ return t.isThingError(sp(p,0)); });
-        else if (method == "enableThing")         run_bool([&]{ return t.enableThing(sp(p,0)); });
-        else if (method == "disableThing")        run_bool([&]{ return t.disableThing(sp(p,0)); });
-        else throw std::invalid_argument("Unknown ThingTester method: " + method);
-    }
-    else if (tester == "RuleTester") {
-        RuleTester t(c);
-        if      (method == "getRuleStatus") {
-            Capture cap;
-            result = t.getRuleStatus(sp(p,0));
-            output = cap.str();
-        }
-        else if (method == "isRuleActive")   run_bool([&]{ return t.isRuleActive(sp(p,0)); });
-        else if (method == "isRuleDisabled") run_bool([&]{ return t.isRuleDisabled(sp(p,0)); });
-        else if (method == "isRuleRunning")  run_bool([&]{ return t.isRuleRunning(sp(p,0)); });
-        else if (method == "isRuleIdle")     run_bool([&]{ return t.isRuleIdle(sp(p,0)); });
-        else if (method == "enableRule")     run_bool([&]{ return t.enableRule(sp(p,0)); });
-        else if (method == "disableRule")    run_bool([&]{ return t.disableRule(sp(p,0)); });
-        else if (method == "runRule")        run_bool([&]{ return t.runRule(sp(p,0)); });
-        else if (method == "testRuleExecution")
-            run_bool([&]{ return t.testRuleExecution(sp(p,0), sp(p,1), sp(p,2)); });
-        else throw std::invalid_argument("Unknown RuleTester method: " + method);
-    }
-    else if (tester == "ChannelTester") {
-        ChannelTester t(c);
-        if      (method == "isItemLinkedToChannel")
-            run_bool([&]{ return t.isItemLinkedToChannel(sp(p,0), sp(p,1)); });
-        else if (method == "getLinksForItem") {
-            Capture cap;
-            result = t.getLinksForItem(sp(p,0));
-            output = cap.str();
-        }
-        else if (method == "isItemLinkedToAnyChannel")
-            run_bool([&]{ return t.isItemLinkedToAnyChannel(sp(p,0)); });
-        else if (method == "hasOrphanedLinks")
-            run_bool([&]{ return t.hasOrphanedLinks(); });
-        else throw std::invalid_argument("Unknown ChannelTester method: " + method);
-    }
-    else if (tester == "PersistenceTester") {
-        PersistenceTester t(c);
-        if      (method == "isItemPersisted")
-            run_bool([&]{ return t.isItemPersisted(sp(p,0), sp(p,1)); });
-        else if (method == "hasDataInRange")
-            run_bool([&]{ return t.hasDataInRange(sp(p,0), sp(p,1), sp(p,2), sp(p,3)); });
-        else if (method == "checkLastPersistedState")
-            run_bool([&]{ return t.checkLastPersistedState(sp(p,0), sp(p,1), sp(p,2)); });
-        else throw std::invalid_argument("Unknown PersistenceTester method: " + method);
-    }
-    else if (tester == "SitemapTester") {
-        SitemapTester t(c);
-        if      (method == "doesSitemapExist")
-            run_bool([&]{ return t.doesSitemapExist(sp(p,0)); });
-        else if (method == "doesSitemapContainItem")
-            run_bool([&]{ return t.doesSitemapContainItem(sp(p,0), sp(p,1)); });
-        else throw std::invalid_argument("Unknown SitemapTester method: " + method);
-    }
-    else {
-        throw std::invalid_argument(
-            "Unknown tester '" + tester + "'. Valid: ItemTester, ThingTester, "
-            "RuleTester, ChannelTester, PersistenceTester, SitemapTester");
-    }
-
-    while (!output.empty() &&
-           (output.back() == '\n' || output.back() == '\r' || output.back() == ' '))
-        output.pop_back();
-
-    return json{{"result", result}, {"output", output}};
-}
-
-// ─── Main ─────────────────────────────────────────────────────────────────────
+}  // namespace
 
 int main() {
-    const char* portEnv = std::getenv("PORT");
-    int port = portEnv ? std::stoi(portEnv) : 8080;
-
+    ts::setLog([](int level, const std::string& message) {
+        if (level >= 1) testOutput += "ERROR: ";
+        testOutput += message + "\n";
+    });
     httplib::Server svr;
 
-    // CORS preflight — regex ".*" matches every path reliably
     svr.Options(".*", [](const httplib::Request&, httplib::Response& res) {
         setCORS(res);
         res.status = 204;
     });
 
-    // Health check
     svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
-        respond_ok(res, {{"status","ok"},
-                         {"service","cpp-openhab-test-suite-backend"}});
+        sendJson(res, json{{"status", "ok"}, {"service", "cpp-openhab-test-suite-backend"},
+                           {"version", ts::VERSION}});
     });
 
-    // POST /api/connect
     svr.Post("/api/connect", [](const httplib::Request& req, httplib::Response& res) {
-        try {
-            auto body = json::parse(req.body);
-            auto c    = makeClient(body);
-            respond_ok(res, {{"loggedIn", c.isLoggedIn()},
-                             {"isCloud",  c.isCloud()}});
-        } catch (const std::exception& e) {
-            respond_ok(res, {{"loggedIn",false},{"isCloud",false},{"error",e.what()}});
-        }
+        json body = json::parse(req.body, nullptr, false);
+        if (!body.is_object()) return sendError(res, "Invalid JSON body", 400);
+        auto c = makeClient(body);
+        json j{{"loggedIn", c->isLoggedIn()}, {"isCloud", c->isCloud()}, {"url", c->url()}};
+        if (!c->lastError().empty()) j["error"] = c->lastError();
+        sendJson(res, j);
     });
 
-    // POST /api/test
     svr.Post("/api/test", [](const httplib::Request& req, httplib::Response& res) {
-        json body;
-        try { body = json::parse(req.body); }
-        catch (...) { respond_err(res, "Invalid JSON body"); return; }
+        json body = json::parse(req.body, nullptr, false);
+        if (!body.is_object()) return sendError(res, "Invalid JSON body", 400);
+        std::string tester = openhab::str(body, "tester"), method = openhab::str(body, "method");
+        if (tester.empty() || method.empty())
+            return sendError(res, "tester and method are required", 400);
+        auto t = TESTERS.find(tester);
+        if (t == TESTERS.end())
+            return sendError(res, "Unknown tester '" + tester + "'. Valid: ItemTester, "
+                             "ThingTester, RuleTester, ChannelTester, PersistenceTester, "
+                             "SitemapTester", 400);
+        auto m = t->second.find(method);
+        if (m == t->second.end())
+            return sendError(res, "Unknown " + tester + " method: " + method, 400);
 
-        std::string tester = body.value("tester", "");
-        std::string method = body.value("method", "");
-        json params        = body.value("params", json::array());
-
-        if (tester.empty()) { respond_err(res, "tester is required"); return; }
-        if (method.empty()) { respond_err(res, "method is required"); return; }
-
-        // Build client via move constructor (copy-assignment/ctor are deleted)
-        OpenHABClient client = [&]() -> OpenHABClient {
-            try { return makeClient(body); }
-            catch (const std::exception& e) {
-                throw std::runtime_error(
-                    std::string("Connection config error: ") + e.what());
-            }
-        }();
-
-        if (!client.isLoggedIn()) {
-            respond_err(res,
-                "Could not connect to openHAB — check URL and credentials", 401);
-            return;
-        }
-
-        try {
-            auto result = dispatch(client, tester, method, params);
-            respond_ok(res, result);
-        } catch (const std::invalid_argument& e) {
-            respond_err(res, e.what(), 400);
-        } catch (const OpenHABException& e) {
-            respond_err(res, std::string("openHAB error: ") + e.what(), 502);
-        } catch (const std::exception& e) {
-            respond_err(res, e.what(), 500);
-        }
+        auto c = makeClient(body);
+        if (!c->isLoggedIn())
+            return sendError(res, "Could not connect to openHAB - check URL and credentials", 401);
+        Params p{body.contains("params") && body["params"].is_array() ? body["params"]
+                                                                       : json::array()};
+        std::lock_guard<std::mutex> lock(testMutex);
+        testOutput.clear();
+        json result = m->second(*c, p);
+        while (!testOutput.empty() && (testOutput.back() == '\n' || testOutput.back() == ' '))
+            testOutput.pop_back();
+        sendJson(res, json{{"result", result}, {"output", testOutput}});
     });
 
-    std::cout << "cpp-openhab-test-suite-backend running on port " << port << "\n";
+    const char* portEnv = std::getenv("PORT");
+    int port = portEnv ? std::atoi(portEnv) : 8080;
+    svr.set_read_timeout(120);
+    svr.set_write_timeout(120);
+    std::cout << "cpp-openhab-test-suite " << ts::VERSION << " backend listening on port " << port
+              << std::endl;
     svr.listen("0.0.0.0", port);
     return 0;
 }
