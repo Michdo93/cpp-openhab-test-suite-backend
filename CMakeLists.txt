@@ -19,7 +19,7 @@ if(OPENHAB_TEST_SUITE_DIR)
 else()
   FetchContent_Declare(cpp_openhab_test_suite
     GIT_REPOSITORY https://github.com/Michdo93/cpp-openhab-test-suite.git
-    GIT_TAG        3e4030d6807f7920f9a1d75dfc7c4330cfbd0396)   # 2.0.0
+    GIT_TAG        9a043243e346edc1ea400366c607fdbd3215c03b)   # 2.0.0
   FetchContent_MakeAvailable(cpp_openhab_test_suite)
 endif()
 
